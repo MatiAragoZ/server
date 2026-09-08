@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { Server: SocketIOServer } = require('socket.io');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -10,12 +11,62 @@ app.use(express.json());
 
 const server = http.createServer(app);
 
+// Default Admin Credentials (can be configured via ENV)
+const ADMIN_USER = process.env.ADMIN_USER || 'admin@escuelaporongo.cl';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+
+// Active Session Tokens (token -> { username, createdAt })
+const activeAuthTokens = new Map();
+
+function generateAuthToken(username) {
+  const token = 'token_' + crypto.randomBytes(32).toString('hex');
+  activeAuthTokens.set(token, { username, createdAt: Date.now() });
+  return token;
+}
+
+function isValidToken(token) {
+  if (!token) return false;
+  return activeAuthTokens.has(token);
+}
+
 // In-Memory Data Store
 const connectedAgents = new Map(); // agentId -> { ws, info, lastSeen }
-const connectedAdmins = new Map(); // socketId -> socket
+const connectedAdmins = new Map(); // socketId -> { socket, username }
 let globalRules = [
   { id: 1, domain: 'malicious-example.com', createdAt: new Date().toISOString() }
 ];
+
+// Authentication REST API Endpoint
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!username || !password) {
+    return res.status(400).json({ success: false, error: 'Ingrese usuario y contraseña' });
+  }
+
+  if (username.trim() === ADMIN_USER && password === ADMIN_PASS) {
+    const token = generateAuthToken(username.trim());
+    console.log(`[Server] Login exitoso para el usuario: ${username}`);
+    return res.json({
+      success: true,
+      token,
+      user: { username: username.trim(), role: 'administrator' }
+    });
+  }
+
+  return res.status(401).json({ success: false, error: 'Usuario o contraseña incorrectos' });
+});
+
+// Middleware for protecting REST API endpoints
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token || !isValidToken(token)) {
+    return res.status(401).json({ success: false, error: 'No autorizado. Inicie sesión.' });
+  }
+  next();
+}
 
 // 1. Socket.io Server for Dashboard Admin connections
 const io = new SocketIOServer(server, {
@@ -25,23 +76,33 @@ const io = new SocketIOServer(server, {
   }
 });
 
+// Authenticate Socket.io Connections
+io.use((socket, next) => {
+  const token = socket.handshake.auth && socket.handshake.auth.token;
+  if (isValidToken(token)) {
+    socket.userData = activeAuthTokens.get(token);
+    return next();
+  }
+  return next(new Error('Authentication error: Token inválido o no proporcionado'));
+});
+
 io.on('connection', (socket) => {
-  console.log(`[Server] Admin Dashboard connected: ${socket.id}`);
+  console.log(`[Server] Admin autenticado conectado: ${socket.id} (${socket.userData.username})`);
   connectedAdmins.set(socket.id, socket);
 
-  // Send initial state to newly connected admin
+  // Send initial state to newly connected authenticated admin
   socket.emit('agent-list-update', getActiveAgentsList());
   socket.emit('rules-list-update', globalRules);
 
   socket.on('disconnect', () => {
-    console.log(`[Server] Admin Dashboard disconnected: ${socket.id}`);
+    console.log(`[Server] Admin desconectado: ${socket.id}`);
     connectedAdmins.delete(socket.id);
   });
 
   // Admin -> Agent Commands
   socket.on('admin-command', (data) => {
     const { targetAgentId, command, payload } = data;
-    console.log(`[Server] Admin ${socket.id} sent command '${command}' to agent '${targetAgentId}'`);
+    console.log(`[Server] Admin ${socket.userData.username} envió orden '${command}' a agente '${targetAgentId}'`);
 
     const agentObj = connectedAgents.get(targetAgentId);
     if (agentObj && agentObj.ws && agentObj.ws.readyState === WebSocket.OPEN) {
@@ -51,7 +112,7 @@ io.on('connection', (socket) => {
         ...payload
       }));
     } else {
-      socket.emit('command-error', { error: `Agent ${targetAgentId} is offline or unreachable.` });
+      socket.emit('command-error', { error: `Agente ${targetAgentId} fuera de línea.` });
     }
   });
 
@@ -186,7 +247,6 @@ function getActiveAgentsList() {
   const list = [];
   const now = Date.now();
   for (const [agentId, agent] of connectedAgents.entries()) {
-    // Exclude stale connections (> 15 seconds without heartbeat)
     if (now - agent.lastSeen <= 15000) {
       list.push({
         ...agent.info,
@@ -204,18 +264,18 @@ function broadcastAgentsToAdmins() {
 }
 
 // REST API Endpoints
-app.get('/api/agents', (req, res) => {
+app.get('/api/agents', authMiddleware, (req, res) => {
   res.json({ success: true, count: connectedAgents.size, agents: getActiveAgentsList() });
 });
 
-app.get('/api/rules', (req, res) => {
+app.get('/api/rules', authMiddleware, (req, res) => {
   res.json({ success: true, rules: globalRules });
 });
 
-app.post('/api/rules', (req, res) => {
+app.post('/api/rules', authMiddleware, (req, res) => {
   const { domain } = req.body;
   if (!domain) {
-    return res.status(400).json({ error: 'Domain is required' });
+    return res.status(400).json({ error: 'El dominio es requerido' });
   }
 
   const cleanDomain = domain.trim().toLowerCase();
@@ -225,7 +285,6 @@ app.post('/api/rules', (req, res) => {
   globalRules.push(newRule);
   io.emit('rules-list-update', globalRules);
 
-  // Broadcast block rule to all connected agents
   for (const [agentId, agentObj] of connectedAgents.entries()) {
     if (agentObj.ws && agentObj.ws.readyState === WebSocket.OPEN) {
       agentObj.ws.send(JSON.stringify({
@@ -238,12 +297,11 @@ app.post('/api/rules', (req, res) => {
   res.json({ success: true, rule: newRule });
 });
 
-app.delete('/api/rules/:id', (req, res) => {
+app.delete('/api/rules/:id', authMiddleware, (req, res) => {
   const ruleId = parseInt(req.params.id);
   globalRules = globalRules.filter(r => r.id !== ruleId);
   io.emit('rules-list-update', globalRules);
 
-  // Broadcast unblock command to all connected agents
   for (const [agentId, agentObj] of connectedAgents.entries()) {
     if (agentObj.ws && agentObj.ws.readyState === WebSocket.OPEN) {
       agentObj.ws.send(JSON.stringify({
