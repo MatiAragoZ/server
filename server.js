@@ -324,6 +324,16 @@ wss.on('connection', (ws) => {
           }
           break;
 
+        case 'LIVE_SCREEN_SNAPSHOT':
+          if (msg.adminId && connectedAdmins.has(msg.adminId)) {
+            const adminSocket = connectedAdmins.get(msg.adminId);
+            adminSocket.emit('agent-screen-snapshot', {
+              agentId: msg.agentId || currentAgentId,
+              image: msg.image
+            });
+          }
+          break;
+
         case 'WEBRTC_STREAM_ERROR':
         case 'WEBRTC_STREAM_CANCELLED':
           if (msg.adminId && connectedAdmins.has(msg.adminId)) {
