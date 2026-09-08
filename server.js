@@ -210,6 +210,13 @@ function authMiddleware(req, res, next) {
   next();
 }
 
+function adminOnlyMiddleware(req, res, next) {
+  if (!req.authUser || req.authUser.rol !== 'administrador') {
+    return res.status(403).json({ success: false, error: 'Acceso denegado. Solo los administradores pueden gestionar cuentas de docentes.' });
+  }
+  next();
+}
+
 // ----------------------------------------------------
 // USER & TEACHER MANAGEMENT REST API ENDPOINTS
 // ----------------------------------------------------
@@ -244,7 +251,7 @@ app.get('/api/users', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/users', authMiddleware, async (req, res) => {
+app.post('/api/users', authMiddleware, adminOnlyMiddleware, async (req, res) => {
   const { rut, nombre, apellidoPaterno, apellidoMaterno, email, password, rol } = req.body;
 
   if (!rut || !nombre || !apellidoPaterno || !apellidoMaterno || !email || !password) {
@@ -317,7 +324,7 @@ app.post('/api/users', authMiddleware, async (req, res) => {
 });
 
 // UPDATE User Account
-app.put('/api/users/:id', authMiddleware, async (req, res) => {
+app.put('/api/users/:id', authMiddleware, adminOnlyMiddleware, async (req, res) => {
   const userId = parseInt(req.params.id);
   const { rut, nombre, apellidoPaterno, apellidoMaterno, email, password, rol } = req.body;
 
@@ -379,7 +386,7 @@ app.put('/api/users/:id', authMiddleware, async (req, res) => {
   }
 });
 
-app.delete('/api/users/:id', authMiddleware, async (req, res) => {
+app.delete('/api/users/:id', authMiddleware, adminOnlyMiddleware, async (req, res) => {
   const userId = parseInt(req.params.id);
   
   if (userId === 1) {
