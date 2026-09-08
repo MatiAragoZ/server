@@ -11,16 +11,45 @@ app.use(express.json());
 
 const server = http.createServer(app);
 
-// Default Admin Credentials (can be configured via ENV)
-const ADMIN_USER = process.env.ADMIN_USER || 'admin@escuelaporongo.cl';
-const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+// In-Memory Database for Users (Teachers & Administrators)
+let registeredUsers = [
+  {
+    id: 1,
+    rut: '1-9',
+    nombre: 'Administrador',
+    apellidoPaterno: 'Sistema',
+    apellidoMaterno: 'Escuela',
+    email: 'admin@escuelaporongo.cl',
+    password: 'admin123',
+    rol: 'administrador',
+    createdAt: new Date().toISOString()
+  },
+  {
+    id: 2,
+    rut: '15.432.109-8',
+    nombre: 'Carlos',
+    apellidoPaterno: 'Muñoz',
+    apellidoMaterno: 'Rojas',
+    email: 'profesor@escuelaporongo.cl',
+    password: 'profe123',
+    rol: 'docente',
+    createdAt: new Date().toISOString()
+  }
+];
 
-// Active Session Tokens (token -> { username, createdAt })
+// Active Session Tokens (token -> userObj)
 const activeAuthTokens = new Map();
 
-function generateAuthToken(username) {
+function generateAuthToken(user) {
   const token = 'token_' + crypto.randomBytes(32).toString('hex');
-  activeAuthTokens.set(token, { username, createdAt: Date.now() });
+  activeAuthTokens.set(token, {
+    id: user.id,
+    rut: user.rut,
+    nombreCompleto: `${user.nombre} ${user.apellidoPaterno} ${user.apellidoMaterno}`,
+    email: user.email,
+    rol: user.rol,
+    createdAt: Date.now()
+  });
   return token;
 }
 
@@ -29,32 +58,53 @@ function isValidToken(token) {
   return activeAuthTokens.has(token);
 }
 
-// In-Memory Data Store
+// In-Memory Data Store for Agents & Rules
 const connectedAgents = new Map(); // agentId -> { ws, info, lastSeen }
-const connectedAdmins = new Map(); // socketId -> { socket, username }
+const connectedAdmins = new Map(); // socketId -> { socket, user }
 let globalRules = [
   { id: 1, domain: 'malicious-example.com', createdAt: new Date().toISOString() }
 ];
 
-// Authentication REST API Endpoint
+// ----------------------------------------------------
+// AUTHENTICATION REST API ENDPOINTS
+// ----------------------------------------------------
+
+// Login Endpoint (Supports Email or RUT)
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   
   if (!username || !password) {
-    return res.status(400).json({ success: false, error: 'Ingrese usuario y contraseña' });
+    return res.status(400).json({ success: false, error: 'Ingrese usuario/RUT y contraseña' });
   }
 
-  if (username.trim() === ADMIN_USER && password === ADMIN_PASS) {
-    const token = generateAuthToken(username.trim());
-    console.log(`[Server] Login exitoso para el usuario: ${username}`);
+  const cleanInput = username.trim().toLowerCase();
+
+  // Find user by Email or RUT
+  const user = registeredUsers.find(u => 
+    u.email.toLowerCase() === cleanInput || 
+    u.rut.toLowerCase().replace(/\./g, '') === cleanInput.replace(/\./g, '')
+  );
+
+  if (user && user.password === password) {
+    const token = generateAuthToken(user);
+    console.log(`[Server] Login exitoso para el usuario: ${user.nombre} ${user.apellidoPaterno} (${user.rol})`);
     return res.json({
       success: true,
       token,
-      user: { username: username.trim(), role: 'administrator' }
+      user: {
+        id: user.id,
+        rut: user.rut,
+        nombre: user.nombre,
+        apellidoPaterno: user.apellidoPaterno,
+        apellidoMaterno: user.apellidoMaterno,
+        nombreCompleto: `${user.nombre} ${user.apellidoPaterno} ${user.apellidoMaterno}`,
+        email: user.email,
+        rol: user.rol
+      }
     });
   }
 
-  return res.status(401).json({ success: false, error: 'Usuario o contraseña incorrectos' });
+  return res.status(401).json({ success: false, error: 'Usuario, RUT o contraseña incorrectos' });
 });
 
 // Middleware for protecting REST API endpoints
@@ -65,10 +115,100 @@ function authMiddleware(req, res, next) {
   if (!token || !isValidToken(token)) {
     return res.status(401).json({ success: false, error: 'No autorizado. Inicie sesión.' });
   }
+  req.authUser = activeAuthTokens.get(token);
   next();
 }
 
-// 1. Socket.io Server for Dashboard Admin connections
+// ----------------------------------------------------
+// USER & TEACHER MANAGEMENT REST API ENDPOINTS
+// ----------------------------------------------------
+
+// List registered users
+app.get('/api/users', authMiddleware, (req, res) => {
+  const safeUsers = registeredUsers.map(u => ({
+    id: u.id,
+    rut: u.rut,
+    nombre: u.nombre,
+    apellidoPaterno: u.apellidoPaterno,
+    apellidoMaterno: u.apellidoMaterno,
+    nombreCompleto: `${u.nombre} ${u.apellidoPaterno} ${u.apellidoMaterno}`,
+    email: u.email,
+    rol: u.rol,
+    createdAt: u.createdAt
+  }));
+  res.json({ success: true, users: safeUsers });
+});
+
+// Create new Teacher / User account
+app.post('/api/users', authMiddleware, (req, res) => {
+  const { rut, nombre, apellidoPaterno, apellidoMaterno, email, password, rol } = req.body;
+
+  if (!rut || !nombre || !apellidoPaterno || !apellidoMaterno || !email || !password) {
+    return res.status(400).json({ success: false, error: 'Todos los campos son obligatorios' });
+  }
+
+  const cleanRut = rut.trim();
+  const cleanEmail = email.trim().toLowerCase();
+
+  // Check if RUT or Email already exists
+  const existingUser = registeredUsers.find(u => 
+    u.email.toLowerCase() === cleanEmail || 
+    u.rut.toLowerCase().replace(/\./g, '') === cleanRut.toLowerCase().replace(/\./g, '')
+  );
+
+  if (existingUser) {
+    return res.status(400).json({ success: false, error: 'El RUT o Correo electrónico ya está registrado' });
+  }
+
+  const newUser = {
+    id: registeredUsers.length > 0 ? Math.max(...registeredUsers.map(u => u.id)) + 1 : 1,
+    rut: cleanRut,
+    nombre: nombre.trim(),
+    apellidoPaterno: apellidoPaterno.trim(),
+    apellidoMaterno: apellidoMaterno.trim(),
+    email: cleanEmail,
+    password: password,
+    rol: rol || 'docente',
+    createdAt: new Date().toISOString()
+  };
+
+  registeredUsers.push(newUser);
+  console.log(`[Server] Nuevo usuario creado: ${newUser.nombre} ${newUser.apellidoPaterno} (${newUser.rol})`);
+
+  res.json({
+    success: true,
+    user: {
+      id: newUser.id,
+      rut: newUser.rut,
+      nombre: newUser.nombre,
+      apellidoPaterno: newUser.apellidoPaterno,
+      apellidoMaterno: newUser.apellidoMaterno,
+      nombreCompleto: `${newUser.nombre} ${newUser.apellidoPaterno} ${newUser.apellidoMaterno}`,
+      email: newUser.email,
+      rol: newUser.rol,
+      createdAt: newUser.createdAt
+    }
+  });
+});
+
+// Delete User account
+app.delete('/api/users/:id', authMiddleware, (req, res) => {
+  const userId = parseInt(req.params.id);
+  
+  if (userId === 1) {
+    return res.status(400).json({ success: false, error: 'No se puede eliminar la cuenta de administrador principal' });
+  }
+
+  registeredUsers = registeredUsers.filter(u => u.id !== userId);
+  console.log(`[Server] Usuario ID ${userId} eliminado`);
+
+  res.json({ success: true, removedId: userId });
+});
+
+// ----------------------------------------------------
+// SOCKET.IO & WEBRTC SIGNALING SERVER
+// ----------------------------------------------------
+
 const io = new SocketIOServer(server, {
   cors: {
     origin: '*',
@@ -87,22 +227,20 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  console.log(`[Server] Admin autenticado conectado: ${socket.id} (${socket.userData.username})`);
+  console.log(`[Server] Admin/Docente autenticado conectado: ${socket.id} (${socket.userData.nombreCompleto})`);
   connectedAdmins.set(socket.id, socket);
 
-  // Send initial state to newly connected authenticated admin
   socket.emit('agent-list-update', getActiveAgentsList());
   socket.emit('rules-list-update', globalRules);
 
   socket.on('disconnect', () => {
-    console.log(`[Server] Admin desconectado: ${socket.id}`);
+    console.log(`[Server] Admin/Docente desconectado: ${socket.id}`);
     connectedAdmins.delete(socket.id);
   });
 
-  // Admin -> Agent Commands
   socket.on('admin-command', (data) => {
     const { targetAgentId, command, payload } = data;
-    console.log(`[Server] Admin ${socket.userData.username} envió orden '${command}' a agente '${targetAgentId}'`);
+    console.log(`[Server] ${socket.userData.nombreCompleto} envió orden '${command}' a agente '${targetAgentId}'`);
 
     const agentObj = connectedAgents.get(targetAgentId);
     if (agentObj && agentObj.ws && agentObj.ws.readyState === WebSocket.OPEN) {
@@ -116,7 +254,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // WebRTC Signaling Answer / Candidate from Admin -> Agent
   socket.on('webrtc-answer', (data) => {
     const { targetAgentId, sdp } = data;
     const agentObj = connectedAgents.get(targetAgentId);
@@ -142,7 +279,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// 2. Native WebSocket Server for Chrome Extension Agents
+// Native WebSocket Server for Extension Agents
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws) => {
@@ -227,22 +364,18 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Handle HTTP Upgrade request routing (Socket.io vs Native WS Agent)
 server.on('upgrade', (request, socket, head) => {
   const pathname = request.url;
 
   if (pathname.startsWith('/socket.io/')) {
-    // Let socket.io handle its own upgrade
     return;
   } else {
-    // Native WebSocket upgrade for Extension Agents
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
   }
 });
 
-// Helper functions
 function getActiveAgentsList() {
   const list = [];
   const now = Date.now();
@@ -263,7 +396,7 @@ function broadcastAgentsToAdmins() {
   io.emit('agent-list-update', agentsList);
 }
 
-// REST API Endpoints
+// REST API Rules Endpoints
 app.get('/api/agents', authMiddleware, (req, res) => {
   res.json({ success: true, count: connectedAgents.size, agents: getActiveAgentsList() });
 });
@@ -314,7 +447,6 @@ app.delete('/api/rules/:id', authMiddleware, (req, res) => {
   res.json({ success: true, removedId: ruleId });
 });
 
-// Periodic stale connection cleanup
 setInterval(() => {
   const now = Date.now();
   let changed = false;
