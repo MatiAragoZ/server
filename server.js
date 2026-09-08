@@ -71,11 +71,9 @@ async function initDatabase() {
       queueLimit: 0
     });
 
-    // Test connection & Auto-Create Tables
     const connection = await dbPool.getConnection();
     console.log(`✅ [DB] Conectado exitosamente a la base de datos MySQL de cPanel: ${dbName} @ ${dbHost}`);
 
-    // Create Users Table
     await connection.query(`
       CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -90,7 +88,6 @@ async function initDatabase() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // Create Rules Table
     await connection.query(`
       CREATE TABLE IF NOT EXISTS rules (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -99,7 +96,6 @@ async function initDatabase() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // Seed default admin if table empty
     const [existingUsers] = await connection.query('SELECT COUNT(*) as count FROM users');
     if (existingUsers[0].count === 0) {
       for (const u of memoryUsers) {
@@ -120,7 +116,6 @@ async function initDatabase() {
   }
 }
 
-// Initialize DB on Startup
 initDatabase();
 
 // Active Session Tokens
@@ -144,9 +139,8 @@ function isValidToken(token) {
   return activeAuthTokens.has(token);
 }
 
-// In-Memory Data Store for Agents
-const connectedAgents = new Map(); // agentId -> { ws, info, lastSeen }
-const connectedAdmins = new Map(); // socketId -> { socket, user }
+const connectedAgents = new Map();
+const connectedAdmins = new Map();
 
 // ----------------------------------------------------
 // AUTHENTICATION REST API ENDPOINTS
@@ -224,7 +218,7 @@ app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     let usersList = [];
     if (useDatabase && dbPool) {
-      const [rows] = await dbPool.query('SELECT id, rut, nombre, apellidoPaterno, apellidoMaterno, email, rol, createdAt FROM users ORDER BY id DESC');
+      const [rows] = await dbPool.query('SELECT id, rut, nombre, apellidoPaterno, apellidoMaterno, email, password, rol, createdAt FROM users ORDER BY id DESC');
       usersList = rows.map(u => ({
         ...u,
         nombreCompleto: `${u.nombre} ${u.apellidoPaterno} ${u.apellidoMaterno}`
@@ -238,6 +232,7 @@ app.get('/api/users', authMiddleware, async (req, res) => {
         apellidoMaterno: u.apellidoMaterno,
         nombreCompleto: `${u.nombre} ${u.apellidoPaterno} ${u.apellidoMaterno}`,
         email: u.email,
+        password: u.password,
         rol: u.rol,
         createdAt: u.createdAt
       }));
@@ -283,6 +278,7 @@ app.post('/api/users', authMiddleware, async (req, res) => {
         apellidoMaterno: apellidoMaterno.trim(),
         nombreCompleto: `${nombre.trim()} ${apellidoPaterno.trim()} ${apellidoMaterno.trim()}`,
         email: cleanEmail,
+        password: password,
         rol: rol || 'docente',
         createdAt: new Date().toISOString()
       };
@@ -316,7 +312,70 @@ app.post('/api/users', authMiddleware, async (req, res) => {
     }
   } catch (err) {
     console.error('Error en POST /api/users:', err);
-    res.status(500).json({ success: false, error: 'Error al registrar usuario en la base de datos' });
+    res.status(500).json({ success: false, error: 'Error al registrar usuario' });
+  }
+});
+
+// UPDATE User Account
+app.put('/api/users/:id', authMiddleware, async (req, res) => {
+  const userId = parseInt(req.params.id);
+  const { rut, nombre, apellidoPaterno, apellidoMaterno, email, password, rol } = req.body;
+
+  if (!rut || !nombre || !apellidoPaterno || !apellidoMaterno || !email) {
+    return res.status(400).json({ success: false, error: 'Campos requeridos incompletos' });
+  }
+
+  const cleanRut = rut.trim();
+  const cleanEmail = email.trim().toLowerCase();
+
+  try {
+    if (useDatabase && dbPool) {
+      // Check duplicate email/rut on other users
+      const [existing] = await dbPool.query(
+        'SELECT id FROM users WHERE (LOWER(email) = ? OR LOWER(REPLACE(rut, ".", "")) = ?) AND id != ?',
+        [cleanEmail, cleanRut.toLowerCase().replace(/\./g, ''), userId]
+      );
+
+      if (existing.length > 0) {
+        return res.status(400).json({ success: false, error: 'El RUT o Correo ya pertenece a otro usuario' });
+      }
+
+      if (password && password.trim()) {
+        await dbPool.query(
+          'UPDATE users SET rut = ?, nombre = ?, apellidoPaterno = ?, apellidoMaterno = ?, email = ?, password = ?, rol = ? WHERE id = ?',
+          [cleanRut, nombre.trim(), apellidoPaterno.trim(), apellidoMaterno.trim(), cleanEmail, password, rol || 'docente', userId]
+        );
+      } else {
+        await dbPool.query(
+          'UPDATE users SET rut = ?, nombre = ?, apellidoPaterno = ?, apellidoMaterno = ?, email = ?, rol = ? WHERE id = ?',
+          [cleanRut, nombre.trim(), apellidoPaterno.trim(), apellidoMaterno.trim(), cleanEmail, rol || 'docente', userId]
+        );
+      }
+
+      console.log(`[Server DB] Usuario ID ${userId} actualizado en MySQL`);
+      return res.json({ success: true, updatedId: userId });
+    } else {
+      const userIndex = memoryUsers.findIndex(u => u.id === userId);
+      if (userIndex === -1) {
+        return res.status(404).json({ success: false, error: 'Usuario no encontrado' });
+      }
+
+      memoryUsers[userIndex] = {
+        ...memoryUsers[userIndex],
+        rut: cleanRut,
+        nombre: nombre.trim(),
+        apellidoPaterno: apellidoPaterno.trim(),
+        apellidoMaterno: apellidoMaterno.trim(),
+        email: cleanEmail,
+        password: (password && password.trim()) ? password : memoryUsers[userIndex].password,
+        rol: rol || 'docente'
+      };
+
+      return res.json({ success: true, updatedId: userId });
+    }
+  } catch (err) {
+    console.error('Error en PUT /api/users:', err);
+    res.status(500).json({ success: false, error: 'Error al actualizar usuario' });
   }
 });
 
@@ -423,7 +482,6 @@ io.on('connection', async (socket) => {
   });
 });
 
-// Native WebSocket Server for Extension Agents
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on('connection', (ws) => {
@@ -556,7 +614,6 @@ function broadcastAgentsToAdmins() {
   io.emit('agent-list-update', agentsList);
 }
 
-// REST API Rules Endpoints
 app.get('/api/agents', authMiddleware, (req, res) => {
   res.json({ success: true, count: connectedAgents.size, agents: getActiveAgentsList() });
 });
